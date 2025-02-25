@@ -1,11 +1,14 @@
 # Universal Data API - SPARQL Data Layer
+
 UDA compliant SPARQL data layer
 
 ## Starting the SPARQL DataLayer
 
 Map the host folder containing the config as a volume and then provide the mapped volume as the first argument.
 
-`docker run -v {PWD}/config:/root/config mimiro/sparql-datalayer /root/config`
+```sh
+docker run -v {PWD}/config:/root/config mimiro/sparql-datalayer /root/config
+```
 
 ## Configuration
 
