@@ -1,6 +1,6 @@
 module github.com/mimiro-io/sparql-datalayer
 
-go 1.22.5
+go 1.24
 
 require (
 	github.com/mimiro-io/common-datalayer v0.2.6

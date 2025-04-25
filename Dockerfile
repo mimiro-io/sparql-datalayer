@@ -1,4 +1,4 @@
-FROM golang:1.22-alpine as build_env
+FROM golang:1.24-alpine as build_env
 
 # Copy go mod and sum files
 COPY go.mod go.sum ./
