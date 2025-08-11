@@ -3,6 +3,7 @@ package layer
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -16,6 +17,12 @@ import (
 	"strings"
 	"text/template"
 )
+
+var insecureHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	},
+}
 
 func EnrichConfig(args []string, config *cdl.Config) error {
 	return nil
@@ -340,8 +347,7 @@ func fetchSPARQLResults(endpoint string, query string, results chan<- SPARQLBind
 	req.Header.Set("Accept", "application/sparql-results+json")
 
 	// Send the request
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := insecureHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -683,8 +689,7 @@ func doSparqlQuery(endpoint, query string) (*SPARQLResult, error) {
 	req.Header.Set("Accept", "application/sparql-results+json")
 
 	// Send the request
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := insecureHTTPClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("sending request: %v", err)
 	}
@@ -718,8 +723,7 @@ func sendSparqlUpdate(endpoint, updateQuery string) error {
 	req.Header.Set("Accept", "application/sparql-results+json")
 
 	// Create an HTTP client and send the request
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := insecureHTTPClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("could not send request: %v", err)
 	}
