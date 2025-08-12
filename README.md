@@ -47,3 +47,16 @@ The following example config shows how to set up the data layer.
 }
 ```
 
+### Environment overrides
+
+The SPARQL connection settings, including basic authentication, can also be
+provided through environment variables:
+
+- `SPARQL_QUERY_ENDPOINT`
+- `SPARQL_UPDATE_ENDPOINT`
+- `SPARQL_USER`
+- `SPARQL_SECRET`
+
+If these variables are set they will override the corresponding values in the
+configuration file.
+
