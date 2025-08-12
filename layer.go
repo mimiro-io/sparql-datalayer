@@ -25,6 +25,41 @@ var insecureHTTPClient = &http.Client{
 }
 
 func EnrichConfig(args []string, config *cdl.Config) error {
+	err := cdl.BuildNativeSystemEnvOverrides(
+		cdl.Env("sparql_query_endpoint"),
+		cdl.Env("sparql_update_endpoint"),
+		cdl.Env("sparql_user", "auth_user"),
+		cdl.Env("sparql_secret", "auth_secret"),
+		cdl.Env("sparql_auth_type", "auth_type"),
+		cdl.Env("sparql_auth_endpoint", "auth_endpoint"),
+	)(config)
+	if err != nil {
+		return err
+	}
+
+	auth := map[string]any{}
+	if existing, ok := config.NativeSystemConfig["auth"].(map[string]any); ok {
+		auth = existing
+	}
+	if v, ok := config.NativeSystemConfig["auth_user"]; ok {
+		auth["user"] = v
+	}
+	if v, ok := config.NativeSystemConfig["auth_secret"]; ok {
+		auth["secret"] = v
+	}
+	if v, ok := config.NativeSystemConfig["auth_type"]; ok {
+		auth["type"] = v
+	}
+	if v, ok := config.NativeSystemConfig["auth_endpoint"]; ok {
+		auth["endpoint"] = v
+	}
+	if len(auth) > 0 {
+		config.NativeSystemConfig["auth"] = auth
+	}
+	delete(config.NativeSystemConfig, "auth_user")
+	delete(config.NativeSystemConfig, "auth_secret")
+	delete(config.NativeSystemConfig, "auth_type")
+	delete(config.NativeSystemConfig, "auth_endpoint")
 	return nil
 }
 
@@ -46,15 +81,16 @@ type SparqlDataLayer struct {
 }
 
 type SparqlDataLayerConfig struct {
-	SparqlQueryEndpoint  string `json:"sparql_query_endpoint"`
-	SparqlUpdateEndpoint string `json:"sparql_update_endpoint"`
+	SparqlQueryEndpoint  string              `json:"sparql_query_endpoint"`
+	SparqlUpdateEndpoint string              `json:"sparql_update_endpoint"`
+	Auth                 *SparqlEndpointAuth `json:"auth"`
 }
 
 type SparqlEndpointAuth struct {
-	User         string `json:"user"`
-	Secret       string `json:"secret"`
-	Type         string `json:"type"`
-	AuthEndpoint string `json:"auth_endpoint"`
+	User     string `json:"user"`
+	Secret   string `json:"secret"`
+	Type     string `json:"type"`
+	Endpoint string `json:"endpoint"`
 }
 
 func (s *SparqlDataLayer) DatasetDescriptions() []*cdl.DatasetDescription {
@@ -205,7 +241,7 @@ func (s *SparqlDataset) Changes(since string, take int, latestOnly bool) (cdl.En
 	}
 
 	// execute the SPARQL query
-	result, err := doSparqlQuery(s.store.config.SparqlQueryEndpoint, maxLastModifiedQueryBuffer.String())
+	result, err := doSparqlQuery(s.store.config.SparqlQueryEndpoint, maxLastModifiedQueryBuffer.String(), s.store.config.Auth)
 	if err != nil {
 		return nil, cdl.Err(err, cdl.LayerErrorInternal)
 	}
@@ -226,7 +262,7 @@ func (s *SparqlDataset) Changes(since string, take int, latestOnly bool) (cdl.En
 	t = template.Must(template.New("changesQuery").Parse(query))
 	err = t.Execute(&changesQueryBuffer, params)
 
-	go fetchSPARQLResults(s.store.config.SparqlQueryEndpoint, changesQueryBuffer.String(), resultsChan)
+	go fetchSPARQLResults(s.store.config.SparqlQueryEndpoint, changesQueryBuffer.String(), s.store.config.Auth, resultsChan)
 
 	iterator := &SparqlEntityIterator{results: result, lastModified: latestModification, resultsChan: resultsChan, done: false}
 	return iterator, nil
@@ -335,7 +371,7 @@ func makeEntityFromBindings(bindings []SPARQLBinding) (*egdm.Entity, error) {
 	return entity, nil
 }
 
-func fetchSPARQLResults(endpoint string, query string, results chan<- SPARQLBinding) error {
+func fetchSPARQLResults(endpoint string, query string, auth *SparqlEndpointAuth, results chan<- SPARQLBinding) error {
 	defer close(results)
 
 	// Prepare the HTTP request
@@ -345,6 +381,10 @@ func fetchSPARQLResults(endpoint string, query string, results chan<- SPARQLBind
 	}
 	req.Header.Set("Content-Type", "application/sparql-query")
 	req.Header.Set("Accept", "application/sparql-results+json")
+
+	if auth != nil && strings.ToLower(auth.Type) == "basic" && auth.User != "" {
+		req.SetBasicAuth(auth.User, auth.Secret)
+	}
 
 	// Send the request
 	resp, err := insecureHTTPClient.Do(req)
@@ -413,13 +453,13 @@ func (s *SparqlDataset) FullSync(ctx context.Context, batchInfo cdl.BatchInfo) (
 	if batchInfo.IsStartBatch {
 		if s.config.FullSyncUpdateStrategy == "truncate" {
 			dropGraphQuery := fmt.Sprintf("CLEAR SILENT GRAPH <%s>", s.config.Graph)
-			err := sendSparqlUpdate(s.store.config.SparqlUpdateEndpoint, dropGraphQuery)
+			err := sendSparqlUpdate(s.store.config.SparqlUpdateEndpoint, dropGraphQuery, s.store.config.Auth)
 			if err != nil {
 				return nil, cdl.Err(err, cdl.LayerErrorInternal)
 			}
 		} else {
 			dropGraphQuery := fmt.Sprintf("CLEAR SILENT GRAPH <%s>", sdw.fullSyncTempGraph)
-			err := sendSparqlUpdate(s.store.config.SparqlUpdateEndpoint, dropGraphQuery)
+			err := sendSparqlUpdate(s.store.config.SparqlUpdateEndpoint, dropGraphQuery, s.store.config.Auth)
 			if err != nil {
 				return nil, cdl.Err(err, cdl.LayerErrorInternal)
 			}
@@ -652,7 +692,7 @@ func (dsw *SparqlDatasetWriter) Flush() cdl.LayerError {
 	}
 
 	// execute the update
-	err := sendSparqlUpdate(dsw.dataset.store.config.SparqlUpdateEndpoint, updateStatement.String())
+	err := sendSparqlUpdate(dsw.dataset.store.config.SparqlUpdateEndpoint, updateStatement.String(), dsw.dataset.store.config.Auth)
 	if err != nil {
 		return cdl.Err(err, cdl.LayerErrorInternal)
 	}
@@ -679,7 +719,7 @@ type SPARQLValue struct {
 	Value string `json:"value"`
 }
 
-func doSparqlQuery(endpoint, query string) (*SPARQLResult, error) {
+func doSparqlQuery(endpoint, query string, auth *SparqlEndpointAuth) (*SPARQLResult, error) {
 	// Prepare the HTTP request
 	req, err := http.NewRequest("POST", endpoint, bytes.NewBufferString(query))
 	if err != nil {
@@ -687,6 +727,9 @@ func doSparqlQuery(endpoint, query string) (*SPARQLResult, error) {
 	}
 	req.Header.Set("Content-Type", "application/sparql-query")
 	req.Header.Set("Accept", "application/sparql-results+json")
+	if auth != nil && strings.ToLower(auth.Type) == "basic" && auth.User != "" {
+		req.SetBasicAuth(auth.User, auth.Secret)
+	}
 
 	// Send the request
 	resp, err := insecureHTTPClient.Do(req)
@@ -711,7 +754,7 @@ func doSparqlQuery(endpoint, query string) (*SPARQLResult, error) {
 	return &result, nil
 }
 
-func sendSparqlUpdate(endpoint, updateQuery string) error {
+func sendSparqlUpdate(endpoint, updateQuery string, auth *SparqlEndpointAuth) error {
 	// Prepare the HTTP request with the SPARQL update query as the body
 	req, err := http.NewRequest("POST", endpoint, bytes.NewBufferString(updateQuery))
 	if err != nil {
@@ -721,6 +764,9 @@ func sendSparqlUpdate(endpoint, updateQuery string) error {
 	// Set appropriate headers
 	req.Header.Set("Content-Type", "application/sparql-update")
 	req.Header.Set("Accept", "application/sparql-results+json")
+	if auth != nil && strings.ToLower(auth.Type) == "basic" && auth.User != "" {
+		req.SetBasicAuth(auth.User, auth.Secret)
+	}
 
 	// Create an HTTP client and send the request
 	resp, err := insecureHTTPClient.Do(req)
@@ -781,7 +827,7 @@ func (dsw *SparqlDatasetWriter) Close() cdl.LayerError {
 	// if full sync and last batch, we need to copy the data from the temp graph to the main graph
 	if dsw.isFullSync && dsw.fullSyncStrategy == TmpGraph && dsw.batchInfo.IsLastBatch {
 		moveGraphQuery := fmt.Sprintf("MOVE GRAPH <%s> TO <%s>", dsw.fullSyncTempGraph, dsw.dataset.config.Graph)
-		err := sendSparqlUpdate(dsw.dataset.store.config.SparqlUpdateEndpoint, moveGraphQuery)
+		err := sendSparqlUpdate(dsw.dataset.store.config.SparqlUpdateEndpoint, moveGraphQuery, dsw.dataset.store.config.Auth)
 		if err != nil {
 			return cdl.Err(err, cdl.LayerErrorInternal)
 		}
