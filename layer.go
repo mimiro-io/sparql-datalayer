@@ -453,13 +453,13 @@ func (s *SparqlDataset) FullSync(ctx context.Context, batchInfo cdl.BatchInfo) (
 	if batchInfo.IsStartBatch {
 		if s.config.FullSyncUpdateStrategy == "truncate" {
 			dropGraphQuery := fmt.Sprintf("CLEAR SILENT GRAPH <%s>", s.config.Graph)
-			err := sendSparqlUpdate(s.store.config.SparqlUpdateEndpoint, dropGraphQuery, s.store.config.Auth)
+			err := sendSparqlUpdate(s.store.config.SparqlUpdateEndpoint, dropGraphQuery, s.store.config.Auth, s.logger)
 			if err != nil {
 				return nil, cdl.Err(err, cdl.LayerErrorInternal)
 			}
 		} else {
 			dropGraphQuery := fmt.Sprintf("CLEAR SILENT GRAPH <%s>", sdw.fullSyncTempGraph)
-			err := sendSparqlUpdate(s.store.config.SparqlUpdateEndpoint, dropGraphQuery, s.store.config.Auth)
+			err := sendSparqlUpdate(s.store.config.SparqlUpdateEndpoint, dropGraphQuery, s.store.config.Auth, s.logger)
 			if err != nil {
 				return nil, cdl.Err(err, cdl.LayerErrorInternal)
 			}
@@ -674,8 +674,6 @@ func (dsw *SparqlDatasetWriter) Flush() cdl.LayerError {
 	}
 	updateData.InsertTriples = builder.String()
 
-	dsw.logger.Debug(fmt.Sprintf("SparqlDatasetWriter: writing triples: %s", updateData.InsertTriples))
-
 	var updateStatement bytes.Buffer
 
 	if dsw.isFullSync {
@@ -694,7 +692,7 @@ func (dsw *SparqlDatasetWriter) Flush() cdl.LayerError {
 	}
 
 	// execute the update
-	err := sendSparqlUpdate(dsw.dataset.store.config.SparqlUpdateEndpoint, updateStatement.String(), dsw.dataset.store.config.Auth)
+	err := sendSparqlUpdate(dsw.dataset.store.config.SparqlUpdateEndpoint, updateStatement.String(), dsw.dataset.store.config.Auth, dsw.logger)
 	if err != nil {
 		return cdl.Err(err, cdl.LayerErrorInternal)
 	}
@@ -756,12 +754,14 @@ func doSparqlQuery(endpoint, query string, auth *SparqlEndpointAuth) (*SPARQLRes
 	return &result, nil
 }
 
-func sendSparqlUpdate(endpoint, updateQuery string, auth *SparqlEndpointAuth) error {
+func sendSparqlUpdate(endpoint, updateQuery string, auth *SparqlEndpointAuth, logger cdl.Logger) error {
 	// Prepare the HTTP request with the SPARQL update query as the body
 	req, err := http.NewRequest("POST", endpoint, bytes.NewBufferString(updateQuery))
 	if err != nil {
 		return fmt.Errorf("could not create request: %v", err)
 	}
+
+	logger.Debug(fmt.Sprintf("SparqlDatasetWriter: writing triples: %s", updateQuery))
 
 	// Set appropriate headers
 	req.Header.Set("Content-Type", "application/sparql-update")
@@ -829,7 +829,7 @@ func (dsw *SparqlDatasetWriter) Close() cdl.LayerError {
 	// if full sync and last batch, we need to copy the data from the temp graph to the main graph
 	if dsw.isFullSync && dsw.fullSyncStrategy == TmpGraph && dsw.batchInfo.IsLastBatch {
 		moveGraphQuery := fmt.Sprintf("MOVE GRAPH <%s> TO <%s>", dsw.fullSyncTempGraph, dsw.dataset.config.Graph)
-		err := sendSparqlUpdate(dsw.dataset.store.config.SparqlUpdateEndpoint, moveGraphQuery, dsw.dataset.store.config.Auth)
+		err := sendSparqlUpdate(dsw.dataset.store.config.SparqlUpdateEndpoint, moveGraphQuery, dsw.dataset.store.config.Auth, dsw.logger)
 		if err != nil {
 			return cdl.Err(err, cdl.LayerErrorInternal)
 		}
