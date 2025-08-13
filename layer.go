@@ -674,6 +674,8 @@ func (dsw *SparqlDatasetWriter) Flush() cdl.LayerError {
 	}
 	updateData.InsertTriples = builder.String()
 
+	dsw.logger.Debug(fmt.Sprintf("SparqlDatasetWriter: writing triples: %s", updateData.InsertTriples))
+
 	var updateStatement bytes.Buffer
 
 	if dsw.isFullSync {
