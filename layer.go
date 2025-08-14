@@ -793,19 +793,24 @@ type UpdateData struct {
 }
 
 const updateTemplateText = `
-WITH <{{ .Graph }}> 
 DELETE {
-	?subject ?predicate ?object
+    GRAPH <{{ .Graph }}> {
+        ?subject ?predicate ?object
+    }
 }
 INSERT {
-	{{ .InsertTriples }} 
+    GRAPH <{{ .Graph }}> {
+        {{ .InsertTriples }}
+    }
 }
 WHERE {
-	VALUES ?subject { {{ .ToDeleteResources }} }
-	BIND(NOW() AS ?now)
-	OPTIONAL {
-		?subject ?predicate ?object
-	}
+    VALUES ?subject { {{ .ToDeleteResources }} }
+    BIND(NOW() AS ?now)
+    OPTIONAL {
+        GRAPH <{{ .Graph }}> {
+            ?subject ?predicate ?object
+        }
+    }
 }`
 
 const insertTemplateText = `
