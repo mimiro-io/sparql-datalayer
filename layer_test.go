@@ -2,20 +2,110 @@ package layer
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	egdm "github.com/mimiro-io/entity-graph-data-model"
 	"io"
+	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	common_datalayer "github.com/mimiro-io/common-datalayer"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/wait"
 )
+
+var (
+	fusekiContainer      testcontainers.Container
+	sparqlQueryEndpoint  string
+	sparqlUpdateEndpoint string
+	testConfigDir        string
+)
+
+func TestMain(m *testing.M) {
+	ctx := context.Background()
+	req := testcontainers.ContainerRequest{
+		Image:        "stain/jena-fuseki",
+		ExposedPorts: []string{"3030/tcp"},
+		Env: map[string]string{
+			"FUSEKI_DATASET_1": "test_layer",
+		},
+		WaitingFor: wait.ForHTTP("/$/ping").WithPort("3030/tcp").WithStartupTimeout(2 * time.Minute),
+	}
+
+	var err error
+	fusekiContainer, err = testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{ContainerRequest: req, Started: true})
+	if err != nil {
+		log.Fatalf("failed to start fuseki container: %v", err)
+	}
+
+	port, err := fusekiContainer.MappedPort(ctx, "3030/tcp")
+	if err != nil {
+		log.Fatalf("failed to get mapped port: %v", err)
+	}
+	host, err := fusekiContainer.Host(ctx)
+	if err != nil {
+		log.Fatalf("failed to get host: %v", err)
+	}
+
+	base := fmt.Sprintf("http://%s:%s/test_layer", host, port.Port())
+	sparqlQueryEndpoint = base + "/sparql"
+	sparqlUpdateEndpoint = base + "/update"
+
+	testConfigDir, err = createConfigDir(sparqlQueryEndpoint, sparqlUpdateEndpoint)
+	if err != nil {
+		log.Fatalf("failed to create config: %v", err)
+	}
+
+	code := m.Run()
+
+	if err := fusekiContainer.Terminate(ctx); err != nil {
+		log.Printf("failed to terminate container: %v", err)
+	}
+
+	os.Exit(code)
+}
+
+func createConfigDir(queryEndpoint, updateEndpoint string) (string, error) {
+	data, err := os.ReadFile("config/config.json")
+	if err != nil {
+		return "", err
+	}
+
+	var cfg map[string]any
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return "", err
+	}
+
+	sc := cfg["system_config"].(map[string]any)
+	sc["sparql_query_endpoint"] = queryEndpoint
+	sc["sparql_update_endpoint"] = updateEndpoint
+
+	dir, err := os.MkdirTemp("", "config")
+	if err != nil {
+		return "", err
+	}
+
+	b, err := json.Marshal(cfg)
+	if err != nil {
+		return "", err
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), b, 0o644); err != nil {
+		return "", err
+	}
+
+	return dir, nil
+}
 
 func TestStartStopSampleDataLayer(t *testing.T) {
 
-	configFile := "./config" //filepath.Join(filepath.Dir(filename), "config")
+	configFile := testConfigDir //filepath.Join(filepath.Dir(filename), "config")
 	serviceRunner := common_datalayer.NewServiceRunner(NewSparqlDataLayer)
 	serviceRunner.WithConfigLocation(configFile)
 	err := serviceRunner.Start()
@@ -54,7 +144,7 @@ func waitForService(url string) {
 
 func TestNewSampleDataLayer(t *testing.T) {
 
-	configFile := "./config"
+	configFile := testConfigDir
 
 	serviceRunner := common_datalayer.NewServiceRunner(NewSparqlDataLayer)
 	serviceRunner.WithConfigLocation(configFile)
@@ -96,7 +186,7 @@ func TestNewSampleDataLayer(t *testing.T) {
 
 func TestContinuation(t *testing.T) {
 
-	configFile := "./config"
+	configFile := testConfigDir
 
 	serviceRunner := common_datalayer.NewServiceRunner(NewSparqlDataLayer)
 	serviceRunner.WithConfigLocation(configFile)
@@ -214,7 +304,7 @@ func TestFullSync(t *testing.T) {
 
 func TestFullSyncMultiPart(t *testing.T) {
 
-	configFile := "./config"
+	configFile := testConfigDir
 
 	serviceRunner := common_datalayer.NewServiceRunner(NewSparqlDataLayer)
 	serviceRunner.WithConfigLocation(configFile)
@@ -277,7 +367,7 @@ func TestFullSyncMultiPart(t *testing.T) {
 	defer resp.Body.Close()
 
 	// do sparql query count
-	count, err := SparqlCountQuery("http://localhost:7200/repositories/test_layer",
+	count, err := SparqlCountQuery(sparqlQueryEndpoint,
 		"SELECT ?s ?p ?o FROM <http://example.org/people> WHERE { ?s ?p ?o }")
 	if err != nil {
 		t.Error("Failed to do sparql query:", err)
