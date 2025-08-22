@@ -67,8 +67,13 @@ func NewSparqlDataLayer(config *cdl.Config, logger cdl.Logger, metrics cdl.Metri
 	sdl := &SparqlDataLayer{logger: logger, metrics: metrics}
 	err := sdl.UpdateConfiguration(config)
 	if err != nil {
+		sdl.logger.Error("Failed to update configuration", "err", err)
 		return nil, err
 	}
+	sdl.logger.Info("Sparql data layer initialized",
+		"queryEndpoint", sdl.store.config.SparqlQueryEndpoint,
+		"updateEndpoint", sdl.store.config.SparqlUpdateEndpoint,
+		"datasets", len(sdl.datasets))
 	return sdl, nil
 }
 
@@ -110,11 +115,13 @@ func (s *SparqlDataLayer) Dataset(dataset string) (cdl.Dataset, cdl.LayerError) 
 	// get dataset from datasets map
 	if s.datasets != nil {
 		if ds, exists := s.datasets[dataset]; exists {
+			s.logger.Debug("Dataset lookup", "dataset", dataset, "found", true)
 			return ds, nil
-		} else {
-			return nil, cdl.Err(errors.New("dataset not found"), cdl.LayerErrorInternal)
 		}
+		s.logger.Warn("Dataset not found", "dataset", dataset)
+		return nil, cdl.Err(errors.New("dataset not found"), cdl.LayerErrorInternal)
 	}
+	s.logger.Error("Dataset map not initialized")
 	return nil, cdl.Err(errors.New("dataset not found"), cdl.LayerErrorInternal)
 }
 
@@ -137,6 +144,10 @@ func (s *SparqlDataLayer) UpdateConfiguration(config *cdl.Config) cdl.LayerError
 
 	// create sparql store
 	s.store = &SparqlStore{logger: s.logger, config: &sparqlConfig}
+	s.logger.Info("Configuring SPARQL data layer",
+		"queryEndpoint", sparqlConfig.SparqlQueryEndpoint,
+		"updateEndpoint", sparqlConfig.SparqlUpdateEndpoint,
+		"datasets", len(config.DatasetDefinitions))
 
 	// create datasets
 	for _, definition := range config.DatasetDefinitions {
@@ -147,6 +158,7 @@ func (s *SparqlDataLayer) UpdateConfiguration(config *cdl.Config) cdl.LayerError
 
 		dataset := NewSparqlDataset(definition.DatasetName, s.logger, s.store, &datasetConfig)
 		s.datasets[dataset.name] = dataset
+		s.logger.Debug("Configured dataset", "dataset", dataset.name)
 	}
 	return nil
 }
@@ -216,10 +228,16 @@ type ChangesQueryParams struct {
 }
 
 func (s *SparqlDataset) Changes(since string, take int, latestOnly bool) (cdl.EntityIterator, cdl.LayerError) {
+	s.logger.Debug("Changes called",
+		"dataset", s.name,
+		"since", since,
+		"take", take,
+		"latestOnly", latestOnly)
 	if since != "" {
 		// decode from base 64
 		decoded, err := base64.StdEncoding.DecodeString(since)
 		if err != nil {
+			s.logger.Warn("Invalid since token", "dataset", s.name, "err", err)
 			return nil, cdl.Err(err, cdl.LayerErrorBadParameter)
 		}
 		since = string(decoded)
@@ -237,17 +255,23 @@ func (s *SparqlDataset) Changes(since string, take int, latestOnly bool) (cdl.En
 	t := template.Must(template.New("maxLastModifiedQuery").Parse(maxLastModifiedQuery))
 	err := t.Execute(&maxLastModifiedQueryBuffer, params)
 	if err != nil {
+		s.logger.Error("Failed to build max last modified query", "dataset", s.name, "err", err)
 		return nil, cdl.Err(err, cdl.LayerErrorInternal)
 	}
+	s.logger.Debug("Executing max last modified query",
+		"dataset", s.name,
+		"query", maxLastModifiedQueryBuffer.String())
 
 	// execute the SPARQL query
-	result, err := doSparqlQuery(s.store.config.SparqlQueryEndpoint, maxLastModifiedQueryBuffer.String(), s.store.config.Auth)
+	result, err := doSparqlQuery(s.logger, s.store.config.SparqlQueryEndpoint, maxLastModifiedQueryBuffer.String(), s.store.config.Auth)
 	if err != nil {
+		s.logger.Error("Max last modified query failed", "dataset", s.name, "err", err)
 		return nil, cdl.Err(err, cdl.LayerErrorInternal)
 	}
 
 	// get the latest modification date to be used as the since token returned
 	latestModification := result.Results.Bindings[0]["latestModification"].Value
+	s.logger.Debug("Latest modification", "dataset", s.name, "value", latestModification)
 
 	resultsChan := make(chan SPARQLBinding)
 
@@ -261,8 +285,19 @@ func (s *SparqlDataset) Changes(since string, take int, latestOnly bool) (cdl.En
 	var changesQueryBuffer bytes.Buffer
 	t = template.Must(template.New("changesQuery").Parse(query))
 	err = t.Execute(&changesQueryBuffer, params)
+	if err != nil {
+		s.logger.Error("Failed to build changes query", "dataset", s.name, "err", err)
+		return nil, cdl.Err(err, cdl.LayerErrorInternal)
+	}
+	s.logger.Debug("Executing changes query",
+		"dataset", s.name,
+		"query", changesQueryBuffer.String())
 
-	go fetchSPARQLResults(s.store.config.SparqlQueryEndpoint, changesQueryBuffer.String(), s.store.config.Auth, resultsChan)
+	go func() {
+		if err := fetchSPARQLResults(s.logger, s.store.config.SparqlQueryEndpoint, changesQueryBuffer.String(), s.store.config.Auth, resultsChan); err != nil {
+			s.logger.Error("Fetching SPARQL results failed", "dataset", s.name, "err", err)
+		}
+	}()
 
 	iterator := &SparqlEntityIterator{results: result, lastModified: latestModification, resultsChan: resultsChan, done: false}
 	return iterator, nil
@@ -371,12 +406,15 @@ func makeEntityFromBindings(bindings []SPARQLBinding) (*egdm.Entity, error) {
 	return entity, nil
 }
 
-func fetchSPARQLResults(endpoint string, query string, auth *SparqlEndpointAuth, results chan<- SPARQLBinding) error {
+func fetchSPARQLResults(logger cdl.Logger, endpoint string, query string, auth *SparqlEndpointAuth, results chan<- SPARQLBinding) error {
 	defer close(results)
+
+	logger.Debug("Fetching SPARQL results", "endpoint", endpoint, "query", query)
 
 	// Prepare the HTTP request
 	req, err := http.NewRequest("POST", endpoint, bytes.NewBufferString(query))
 	if err != nil {
+		logger.Error("Failed to create request", "endpoint", endpoint, "err", err)
 		return err
 	}
 	req.Header.Set("Content-Type", "application/sparql-query")
@@ -389,6 +427,7 @@ func fetchSPARQLResults(endpoint string, query string, auth *SparqlEndpointAuth,
 	// Send the request
 	resp, err := insecureHTTPClient.Do(req)
 	if err != nil {
+		logger.Error("Failed to fetch results", "endpoint", endpoint, "err", err)
 		return err
 	}
 	defer resp.Body.Close()
@@ -402,6 +441,7 @@ func fetchSPARQLResults(endpoint string, query string, auth *SparqlEndpointAuth,
 			if err == io.EOF {
 				break
 			}
+			logger.Error("Reading JSON token failed", "endpoint", endpoint, "err", err)
 			return fmt.Errorf("reading JSON token: %v", err)
 		}
 
@@ -418,6 +458,7 @@ func fetchSPARQLResults(endpoint string, query string, auth *SparqlEndpointAuth,
 	for decoder.More() {
 		var binding SPARQLBinding
 		if err := decoder.Decode(&binding); err != nil {
+			logger.Error("Decoding binding failed", "endpoint", endpoint, "err", err)
 			return fmt.Errorf("decoding binding: %v", err)
 		}
 		results <- binding
@@ -447,20 +488,26 @@ func (s *SparqlDataset) Name() string {
 }
 
 func (s *SparqlDataset) FullSync(ctx context.Context, batchInfo cdl.BatchInfo) (cdl.DatasetWriter, cdl.LayerError) {
+	s.logger.Info("Starting full sync", "dataset", s.name, "syncId", batchInfo.SyncId)
+
 	sdw := NewSparqlDatasetWriter(s, s.logger, batchInfo, true, s.config.WriteBatchSize)
 
-	// if first batch then we need to clear the graph / tmp grap
+	// if first batch then we need to clear the graph / tmp graph
 	if batchInfo.IsStartBatch {
 		if s.config.FullSyncUpdateStrategy == "truncate" {
+			s.logger.Debug("Clearing graph for full sync", "dataset", s.name, "strategy", "truncate")
 			dropGraphQuery := fmt.Sprintf("CLEAR SILENT GRAPH <%s>", s.config.Graph)
 			err := sendSparqlUpdate(s.store.config.SparqlUpdateEndpoint, dropGraphQuery, s.store.config.Auth, s.logger)
 			if err != nil {
+				s.logger.Error("Failed to clear graph", "dataset", s.name, "err", err)
 				return nil, cdl.Err(err, cdl.LayerErrorInternal)
 			}
 		} else {
+			s.logger.Debug("Clearing temp graph for full sync", "dataset", s.name, "strategy", "tmp")
 			dropGraphQuery := fmt.Sprintf("CLEAR SILENT GRAPH <%s>", sdw.fullSyncTempGraph)
 			err := sendSparqlUpdate(s.store.config.SparqlUpdateEndpoint, dropGraphQuery, s.store.config.Auth, s.logger)
 			if err != nil {
+				s.logger.Error("Failed to clear temp graph", "dataset", s.name, "err", err)
 				return nil, cdl.Err(err, cdl.LayerErrorInternal)
 			}
 		}
@@ -470,6 +517,7 @@ func (s *SparqlDataset) FullSync(ctx context.Context, batchInfo cdl.BatchInfo) (
 }
 
 func (s *SparqlDataset) Incremental(ctx context.Context) (cdl.DatasetWriter, cdl.LayerError) {
+	s.logger.Info("Starting incremental sync", "dataset", s.name)
 	sdw := NewSparqlDatasetWriter(s, s.logger, cdl.BatchInfo{}, false, s.config.WriteBatchSize)
 	return sdw, nil
 }
@@ -553,6 +601,8 @@ func (dsw *SparqlDatasetWriter) Write(entity *egdm.Entity) cdl.LayerError {
 	// increment written count
 	dsw.written++
 
+	dsw.logger.Debug("Queueing entity", "dataset", dsw.dataset.name, "id", entity.ID, "deleted", entity.IsDeleted)
+
 	// if entity is deleted, we omit it from the update graph
 	if !entity.IsDeleted {
 		// do properties
@@ -564,7 +614,7 @@ func (dsw *SparqlDatasetWriter) Write(entity *egdm.Entity) cdl.LayerError {
 				for _, v := range anyValues {
 					object, ok := makeNTLiteralString(v)
 					if !ok {
-						// log this as warning
+						dsw.logger.Warn("Unsupported property type", "dataset", dsw.dataset.name, "predicate", predicate, "type", reflect.TypeOf(v).String())
 						continue
 					}
 					t := subject + " <" + predicate + "> " + object + " .\n"
@@ -576,7 +626,7 @@ func (dsw *SparqlDatasetWriter) Write(entity *egdm.Entity) cdl.LayerError {
 					t := subject + " <" + predicate + "> " + object + " .\n"
 					dsw.batchGraph = append(dsw.batchGraph, t)
 				} else {
-					// log this as warning
+					dsw.logger.Warn("Unsupported property type", "dataset", dsw.dataset.name, "predicate", predicate, "type", reflect.TypeOf(value).String())
 				}
 			}
 		}
@@ -605,8 +655,10 @@ func (dsw *SparqlDatasetWriter) Write(entity *egdm.Entity) cdl.LayerError {
 	dsw.batchGraph = append(dsw.batchGraph, t)
 
 	if dsw.written == dsw.batchSize {
+		dsw.logger.Debug("Batch size reached, flushing", "dataset", dsw.dataset.name, "size", dsw.written)
 		err := dsw.Flush()
 		if err != nil {
+			dsw.logger.Error("Flush failed", "dataset", dsw.dataset.name, "err", err)
 			return err
 		}
 	}
@@ -680,6 +732,7 @@ func (dsw *SparqlDatasetWriter) Flush() cdl.LayerError {
 		t := template.Must(template.New("sparqlInsert").Parse(insertTemplateText))
 		err := t.Execute(&updateStatement, updateData)
 		if err != nil {
+			dsw.logger.Error("Executing insert template failed", "dataset", dsw.dataset.name, "err", err)
 			return cdl.Err(err, cdl.LayerErrorInternal)
 		}
 	} else {
@@ -687,13 +740,17 @@ func (dsw *SparqlDatasetWriter) Flush() cdl.LayerError {
 		t := template.Must(template.New("sparqlUpdate").Parse(updateTemplateText))
 		err := t.Execute(&updateStatement, updateData)
 		if err != nil {
+			dsw.logger.Error("Executing update template failed", "dataset", dsw.dataset.name, "err", err)
 			return cdl.Err(err, cdl.LayerErrorInternal)
 		}
 	}
 
+	dsw.logger.Debug("Flushing batch", "dataset", dsw.dataset.name, "triples", len(dsw.batchGraph))
+
 	// execute the update
 	err := sendSparqlUpdate(dsw.dataset.store.config.SparqlUpdateEndpoint, updateStatement.String(), dsw.dataset.store.config.Auth, dsw.logger)
 	if err != nil {
+		dsw.logger.Error("SPARQL update failed", "dataset", dsw.dataset.name, "err", err)
 		return cdl.Err(err, cdl.LayerErrorInternal)
 	}
 
@@ -719,10 +776,13 @@ type SPARQLValue struct {
 	Value string `json:"value"`
 }
 
-func doSparqlQuery(endpoint, query string, auth *SparqlEndpointAuth) (*SPARQLResult, error) {
+func doSparqlQuery(logger cdl.Logger, endpoint, query string, auth *SparqlEndpointAuth) (*SPARQLResult, error) {
+	logger.Debug("Executing SPARQL query", "endpoint", endpoint, "query", query)
+
 	// Prepare the HTTP request
 	req, err := http.NewRequest("POST", endpoint, bytes.NewBufferString(query))
 	if err != nil {
+		logger.Error("Failed to create request", "endpoint", endpoint, "err", err)
 		return nil, fmt.Errorf("creating request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/sparql-query")
@@ -734,6 +794,7 @@ func doSparqlQuery(endpoint, query string, auth *SparqlEndpointAuth) (*SPARQLRes
 	// Send the request
 	resp, err := insecureHTTPClient.Do(req)
 	if err != nil {
+		logger.Error("Request failed", "endpoint", endpoint, "err", err)
 		return nil, fmt.Errorf("sending request: %v", err)
 	}
 	defer resp.Body.Close()
@@ -741,12 +802,14 @@ func doSparqlQuery(endpoint, query string, auth *SparqlEndpointAuth) (*SPARQLRes
 	// Read the response body
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		logger.Error("Reading response body failed", "endpoint", endpoint, "err", err)
 		return nil, fmt.Errorf("reading response body: %v", err)
 	}
 
 	// Parse the JSON response
 	var result SPARQLResult
 	if err := json.Unmarshal(body, &result); err != nil {
+		logger.Error("Parsing JSON failed", "endpoint", endpoint, "err", err)
 		return nil, fmt.Errorf("parsing JSON: %v", err)
 	}
 
@@ -758,10 +821,10 @@ func sendSparqlUpdate(endpoint, updateQuery string, auth *SparqlEndpointAuth, lo
 	// Prepare the HTTP request with the SPARQL update query as the body
 	req, err := http.NewRequest("POST", endpoint, bytes.NewBufferString(updateQuery))
 	if err != nil {
+		logger.Error("Failed to create update request", "endpoint", endpoint, "err", err)
 		return fmt.Errorf("could not create request: %v", err)
 	}
-
-	logger.Debug(fmt.Sprintf("SparqlDatasetWriter: writing triples: %s", updateQuery))
+	logger.Debug("SparqlDatasetWriter: writing triples", "endpoint", endpoint, "query", updateQuery)
 
 	// Set appropriate headers
 	req.Header.Set("Content-Type", "application/sparql-update")
@@ -773,6 +836,7 @@ func sendSparqlUpdate(endpoint, updateQuery string, auth *SparqlEndpointAuth, lo
 	// Create an HTTP client and send the request
 	resp, err := insecureHTTPClient.Do(req)
 	if err != nil {
+		logger.Error("Failed to send update request", "endpoint", endpoint, "err", err)
 		return fmt.Errorf("could not send request: %v", err)
 	}
 	defer resp.Body.Close()
@@ -780,6 +844,7 @@ func sendSparqlUpdate(endpoint, updateQuery string, auth *SparqlEndpointAuth, lo
 	// Check the response status
 	if !(resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent) {
 		body, _ := io.ReadAll(resp.Body)
+		logger.Error("SPARQL update failed", "endpoint", endpoint, "status", resp.Status, "body", string(body))
 		return fmt.Errorf("SPARQL update failed: %s %s", resp.Status, string(body))
 	}
 
@@ -825,20 +890,25 @@ WHERE {
 
 func (dsw *SparqlDatasetWriter) Close() cdl.LayerError {
 	if dsw.written > 0 {
+		dsw.logger.Debug("Closing writer, flushing remaining entities", "dataset", dsw.dataset.name, "remaining", dsw.written)
 		err := dsw.Flush()
 		if err != nil {
+			dsw.logger.Error("Final flush failed", "dataset", dsw.dataset.name, "err", err)
 			return err
 		}
 	}
 
 	// if full sync and last batch, we need to copy the data from the temp graph to the main graph
 	if dsw.isFullSync && dsw.fullSyncStrategy == TmpGraph && dsw.batchInfo.IsLastBatch {
+		dsw.logger.Debug("Moving temp graph to main graph", "dataset", dsw.dataset.name)
 		moveGraphQuery := fmt.Sprintf("MOVE GRAPH <%s> TO <%s>", dsw.fullSyncTempGraph, dsw.dataset.config.Graph)
 		err := sendSparqlUpdate(dsw.dataset.store.config.SparqlUpdateEndpoint, moveGraphQuery, dsw.dataset.store.config.Auth, dsw.logger)
 		if err != nil {
+			dsw.logger.Error("Moving temp graph failed", "dataset", dsw.dataset.name, "err", err)
 			return cdl.Err(err, cdl.LayerErrorInternal)
 		}
 	}
 
+	dsw.logger.Info("Closed dataset writer", "dataset", dsw.dataset.name, "written", dsw.written)
 	return nil
 }
