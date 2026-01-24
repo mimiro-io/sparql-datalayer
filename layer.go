@@ -874,6 +874,7 @@ WHERE {
     OPTIONAL {
         GRAPH <{{ .Graph }}> {
             ?subject ?predicate ?object
+            FILTER(isLiteral(?object))
         }
     }
 }`

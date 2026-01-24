@@ -27,4 +27,7 @@ func TestUpdateTemplateUsesGraph(t *testing.T) {
 	if count := strings.Count(result, "GRAPH <"+data.Graph+">"); count != 3 {
 		t.Errorf("expected 3 GRAPH clauses, got %d: %s", count, result)
 	}
+	if !strings.Contains(result, "FILTER(isLiteral(?object))") {
+		t.Errorf("expected literal-only delete filter, got: %s", result)
+	}
 }
