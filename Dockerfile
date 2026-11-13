@@ -1,4 +1,4 @@
-FROM golang:1.26-alpine AS build
+FROM golang:1.27.4-alpine AS build
 
 WORKDIR /app
 
@@ -19,6 +19,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -a -o /sparql-datalayer ./cmd/main.go
 FROM gcr.io/distroless/static-debian12:nonroot
 # Copy the Pre-built binary file from the previous stage
 COPY --from=build /sparql-datalayer /
+USER nonroot
 
 # Expose port 8090 to the outside world
 EXPOSE 8090
